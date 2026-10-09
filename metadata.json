@@ -1,0 +1,6 @@
+{
+  "name": "مصمم شقتي",
+  "description": "تطبيق لتصميم وتخطيط الشقق 3D مع نظام حوائط متقدم، أبواب وشبابيك حقيقية، ألوان وتشطيبات، وحساب تكلفة.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
