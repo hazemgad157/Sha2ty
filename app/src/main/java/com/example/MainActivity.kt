@@ -52,9 +52,11 @@ fun ApartmentApp(
     viewModel: ApartmentPlannerViewModel = viewModel()
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
+    val savedProjects by viewModel.savedProjects.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
     // Dialog & Sheet States
+    var showProjectsDialog by remember { mutableStateOf(false) }
     var showCatalogSheet by remember { mutableStateOf(false) }
     var showBudgetDialog by remember { mutableStateOf(false) }
     var showShareDialog by remember { mutableStateOf(false) }
@@ -114,6 +116,11 @@ fun ApartmentApp(
                             contentDescription = "كهربا وسباكة",
                             tint = if (state.showMepLayer) Color(0xFFEAB308) else MaterialTheme.colorScheme.onSurfaceVariant
                         )
+                    }
+
+                    // Saved Projects (Room DB)
+                    IconButton(onClick = { showProjectsDialog = true }) {
+                        Icon(Icons.Default.Folder, contentDescription = "مشاريعي المحفوظة")
                     }
 
                     // Budget & Quantities Dialog
@@ -371,6 +378,26 @@ fun ApartmentApp(
                 }
             }
         }
+    }
+
+    // Projects Manager Dialog (Room Database)
+    if (showProjectsDialog) {
+        ProjectsManagerDialog(
+            savedProjects = savedProjects,
+            onDismiss = { showProjectsDialog = false },
+            onSaveCurrent = { pName, cName, notes ->
+                viewModel.saveCurrentProject(pName, cName, notes)
+                Toast.makeText(context, "تم حفظ المشروع في قاعدة البيانات بنجاح!", Toast.LENGTH_SHORT).show()
+            },
+            onLoadProject = { p ->
+                viewModel.loadSavedProject(p)
+                Toast.makeText(context, "تم فتح المشروع: ${p.name}", Toast.LENGTH_SHORT).show()
+            },
+            onDeleteProject = { pId ->
+                viewModel.deleteSavedProject(pId)
+                Toast.makeText(context, "تم حذف المشروع.", Toast.LENGTH_SHORT).show()
+            }
+        )
     }
 
     // Catalog Bottom Sheet

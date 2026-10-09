@@ -1,16 +1,26 @@
 package com.example.viewmodel
 
+import android.app.Application
 import android.util.Base64
 import androidx.compose.ui.geometry.Offset
-import androidx.lifecycle.ViewModel
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
 import com.example.data.CatalogData
+import com.example.data.local.ApartmentDatabase
+import com.example.data.local.ApartmentRepository
+import com.example.data.local.entities.ProjectEntity
+import com.example.data.local.entities.RoomLayoutEntity
+import com.example.data.local.entities.WallDimensionEntity
 import com.example.engine.FloorPlanEngine
 import com.example.engine.QuantitiesEstimate
 import com.example.model.*
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 import java.nio.charset.StandardCharsets
@@ -47,7 +57,19 @@ data class ApartmentUiState(
     val quantitiesEstimate: QuantitiesEstimate? = null
 )
 
-class ApartmentPlannerViewModel : ViewModel() {
+class ApartmentPlannerViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val repository = ApartmentRepository(
+        ApartmentDatabase.getDatabase(application).apartmentDao()
+    )
+
+    // Flow of saved projects from Room Database
+    val savedProjects: StateFlow<List<ProjectEntity>> = repository.allProjects
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
 
     private val _uiState = MutableStateFlow(ApartmentUiState())
     val uiState: StateFlow<ApartmentUiState> = _uiState.asStateFlow()
@@ -88,6 +110,107 @@ class ApartmentPlannerViewModel : ViewModel() {
         }
         recalculateQuantities()
     }
+
+    // --- Room Database Operations ---
+
+    fun saveCurrentProject(projectName: String, clientName: String, notes: String) {
+        viewModelScope.launch {
+            val state = _uiState.value
+            val projectId = "proj_" + UUID.randomUUID().toString().take(8)
+            val jsonSnapshot = serializeFullSnapshot(state)
+
+            val totalArea = state.quantitiesEstimate?.totalFloorAreaM2 ?: 0f
+            val totalBudget = state.quantitiesEstimate?.furnitureTotalEgp ?: 0.0
+
+            val projectEntity = ProjectEntity(
+                projectId = projectId,
+                name = projectName,
+                clientName = clientName,
+                createdAt = System.currentTimeMillis(),
+                updatedAt = System.currentTimeMillis(),
+                totalFloorAreaM2 = totalArea,
+                totalEstimatedBudgetEgp = totalBudget,
+                notes = notes,
+                snapshotJson = jsonSnapshot
+            )
+
+            // Normalized Room Layout Entities
+            val roomEntities = state.rooms.map { r ->
+                val pointsArr = JSONArray()
+                r.points.forEach { pt ->
+                    val pObj = JSONObject()
+                    pObj.put("x", pt.x)
+                    pObj.put("y", pt.y)
+                    pointsArr.put(pObj)
+                }
+                RoomLayoutEntity(
+                    roomId = r.id,
+                    projectId = projectId,
+                    roomName = r.name,
+                    floorMaterial = r.floorMaterial.name,
+                    tileSizeCm = r.tileSizeCm,
+                    floorColorHex = r.floorColor,
+                    ceilingHeightM = r.ceilingHeight,
+                    hasGypsumCove = r.hasGypsumCove,
+                    calculatedAreaM2 = FloorPlanEngine.calculatePolygonArea(r.points),
+                    polygonPointsJson = pointsArr.toString()
+                )
+            }
+
+            // Normalized Wall Dimension Entities
+            val wallEntities = state.walls.map { w ->
+                WallDimensionEntity(
+                    wallId = w.id,
+                    projectId = projectId,
+                    lengthMeters = w.length,
+                    thicknessMeters = w.thickness,
+                    heightMeters = w.height,
+                    startX = w.start.x,
+                    startY = w.start.y,
+                    endX = w.end.x,
+                    endY = w.end.y,
+                    innerColorHex = w.innerColor,
+                    outerColorHex = w.outerColor,
+                    paintBrandCode = w.paintBrandCode,
+                    isAccent = w.isAccent,
+                    hasBumpOut = w.bumpOut != null,
+                    bumpOutDepthM = w.bumpOut?.depthMeters ?: 0f,
+                    openingsCount = w.openings.size
+                )
+            }
+
+            repository.saveProject(projectEntity, roomEntities, wallEntities)
+        }
+    }
+
+    fun loadSavedProject(project: ProjectEntity) {
+        val snapshot = deserializeFullSnapshot(project.snapshotJson)
+        if (snapshot != null) {
+            pushUndo()
+            _uiState.update {
+                it.copy(
+                    walls = snapshot.walls,
+                    portals = snapshot.portals,
+                    rooms = snapshot.rooms,
+                    furniture = snapshot.furniture,
+                    columns = snapshot.columns,
+                    mepItems = snapshot.mepItems,
+                    selectedWallId = null,
+                    selectedFurnitureId = null,
+                    selectedPortalId = null
+                )
+            }
+            recalculateQuantities()
+        }
+    }
+
+    fun deleteSavedProject(projectId: String) {
+        viewModelScope.launch {
+            repository.deleteProject(projectId)
+        }
+    }
+
+    // --- State & History Operations ---
 
     private fun pushUndo() {
         val current = _uiState.value
@@ -416,7 +539,6 @@ class ApartmentPlannerViewModel : ViewModel() {
             variantA ?: currentSnap
         } else {
             variantB ?: currentSnap.copy(
-                // create a modern alternative for B
                 walls = currentSnap.walls.map { it.copy(innerColor = 0xFF1D3557, isAccent = true) }
             )
         }
@@ -473,28 +595,9 @@ class ApartmentPlannerViewModel : ViewModel() {
 
     fun getShareableCode(): String {
         return try {
-            val s = _uiState.value
-            val root = JSONObject()
-            root.put("v", 1)
-            val wallsArr = JSONArray()
-            for (w in s.walls) {
-                val o = JSONObject()
-                o.put("id", w.id)
-                o.put("sx", w.start.x.toDouble())
-                o.put("sy", w.start.y.toDouble())
-                o.put("ex", w.end.x.toDouble())
-                o.put("ey", w.end.y.toDouble())
-                o.put("t", w.thickness.toDouble())
-                o.put("h", w.height.toDouble())
-                o.put("ic", w.innerColor)
-                o.put("oc", w.outerColor)
-                o.put("acc", w.isAccent)
-                wallsArr.put(o)
-            }
-            root.put("walls", wallsArr)
-            val jsonStr = root.toString()
+            val jsonStr = serializeFullSnapshot(_uiState.value)
             Base64.encodeToString(jsonStr.toByteArray(StandardCharsets.UTF_8), Base64.NO_WRAP)
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             "ERR_CODE"
         }
     }
@@ -503,48 +606,322 @@ class ApartmentPlannerViewModel : ViewModel() {
         try {
             val bytes = Base64.decode(code.trim(), Base64.DEFAULT)
             val jsonStr = String(bytes, StandardCharsets.UTF_8)
-            val root = JSONObject(jsonStr)
-            val wallsArr = root.getJSONArray("walls")
-            val newWalls = mutableListOf<WallSegment>()
-            for (i in 0 until wallsArr.length()) {
-                val o = wallsArr.getJSONObject(i)
-                newWalls.add(
-                    WallSegment(
-                        id = o.optString("id", "w_$i"),
-                        start = Point2D(o.getDouble("sx").toFloat(), o.getDouble("sy").toFloat()),
-                        end = Point2D(o.getDouble("ex").toFloat(), o.getDouble("ey").toFloat()),
-                        thickness = o.optDouble("t", 0.15).toFloat(),
-                        height = o.optDouble("h", 2.80).toFloat(),
-                        innerColor = o.optLong("ic", 0xFFEAE6DC),
-                        outerColor = o.optLong("oc", 0xFFB0BEC5),
-                        isAccent = o.optBoolean("acc", false)
-                    )
-                )
-            }
-            if (newWalls.isNotEmpty()) {
+            val snapshot = deserializeFullSnapshot(jsonStr)
+            if (snapshot != null) {
                 pushUndo()
-                _uiState.update { it.copy(walls = newWalls) }
+                _uiState.update {
+                    it.copy(
+                        walls = snapshot.walls,
+                        portals = snapshot.portals,
+                        rooms = snapshot.rooms,
+                        furniture = snapshot.furniture,
+                        columns = snapshot.columns,
+                        mepItems = snapshot.mepItems
+                    )
+                }
                 recalculateQuantities()
             }
         } catch (_: Exception) {
         }
     }
 
-    fun clearAll() {
-        pushUndo()
-        _uiState.update {
-            it.copy(
-                walls = emptyList(),
-                portals = emptyList(),
-                rooms = emptyList(),
-                furniture = emptyList(),
-                columns = emptyList(),
-                mepItems = emptyList(),
-                selectedWallId = null,
-                selectedFurnitureId = null,
-                selectedPortalId = null
-            )
+    // --- JSON Serialization Helpers ---
+
+    private fun serializeFullSnapshot(state: ApartmentUiState): String {
+        val root = JSONObject()
+        root.put("v", 2)
+
+        // Walls
+        val wallsArr = JSONArray()
+        for (w in state.walls) {
+            val o = JSONObject()
+            o.put("id", w.id)
+            o.put("sx", w.start.x.toDouble())
+            o.put("sy", w.start.y.toDouble())
+            o.put("ex", w.end.x.toDouble())
+            o.put("ey", w.end.y.toDouble())
+            o.put("t", w.thickness.toDouble())
+            o.put("h", w.height.toDouble())
+            o.put("ic", w.innerColor)
+            o.put("oc", w.outerColor)
+            o.put("acc", w.isAccent)
+            o.put("acCol", w.accentColor)
+            o.put("brand", w.paintBrandCode)
+            if (w.bumpOut != null) {
+                val bo = JSONObject()
+                bo.put("id", w.bumpOut.id)
+                bo.put("off", w.bumpOut.offsetMeters.toDouble())
+                bo.put("w", w.bumpOut.widthMeters.toDouble())
+                bo.put("d", w.bumpOut.depthMeters.toDouble())
+                bo.put("out", w.bumpOut.isOutward)
+                o.put("bump", bo)
+            }
+            wallsArr.put(o)
         }
-        recalculateQuantities()
+        root.put("walls", wallsArr)
+
+        // Portals
+        val portalsArr = JSONArray()
+        for (p in state.portals) {
+            val o = JSONObject()
+            o.put("id", p.id)
+            o.put("wallId", p.wallId)
+            o.put("off", p.offsetMeters.toDouble())
+            o.put("w", p.width.toDouble())
+            o.put("h", p.height.toDouble())
+            o.put("el", p.elevation.toDouble())
+            o.put("type", p.type.name)
+            o.put("swing", p.swing.name)
+            o.put("fc", p.frameColor)
+            o.put("gt", p.glassType.name)
+            portalsArr.put(o)
+        }
+        root.put("portals", portalsArr)
+
+        // Rooms
+        val roomsArr = JSONArray()
+        for (r in state.rooms) {
+            val o = JSONObject()
+            o.put("id", r.id)
+            o.put("name", r.name)
+            o.put("mat", r.floorMaterial.name)
+            o.put("col", r.floorColor)
+            o.put("tile", r.tileSizeCm)
+            o.put("ch", r.ceilingHeight.toDouble())
+            o.put("cove", r.hasGypsumCove)
+            val ptsArr = JSONArray()
+            r.points.forEach { pt ->
+                val po = JSONObject()
+                po.put("x", pt.x.toDouble())
+                po.put("y", pt.y.toDouble())
+                ptsArr.put(po)
+            }
+            o.put("pts", ptsArr)
+            roomsArr.put(o)
+        }
+        root.put("rooms", roomsArr)
+
+        // Furniture
+        val furnArr = JSONArray()
+        for (f in state.furniture) {
+            val o = JSONObject()
+            o.put("id", f.id)
+            o.put("name", f.name)
+            o.put("cat", f.category.name)
+            o.put("x", f.x.toDouble())
+            o.put("y", f.y.toDouble())
+            o.put("w", f.width.toDouble())
+            o.put("d", f.depth.toDouble())
+            o.put("h", f.height.toDouble())
+            o.put("rot", f.rotationDeg.toDouble())
+            o.put("pc", f.primaryColor)
+            o.put("sc", f.secondaryColor)
+            o.put("fc", f.fabricColor)
+            o.put("mat", f.materialName)
+            o.put("lock", f.isLocked)
+            o.put("price", f.priceEgp)
+            o.put("stat", f.purchaseStatus.name)
+            o.put("model", f.modelKey)
+            furnArr.put(o)
+        }
+        root.put("furniture", furnArr)
+
+        // Columns
+        val colsArr = JSONArray()
+        for (c in state.columns) {
+            val o = JSONObject()
+            o.put("id", c.id)
+            o.put("x", c.x.toDouble())
+            o.put("y", c.y.toDouble())
+            o.put("w", c.width.toDouble())
+            o.put("d", c.depth.toDouble())
+            colsArr.put(o)
+        }
+        root.put("columns", colsArr)
+
+        // MEP Items
+        val mepArr = JSONArray()
+        for (m in state.mepItems) {
+            val o = JSONObject()
+            o.put("id", m.id)
+            o.put("name", m.nameAr)
+            o.put("type", m.type.name)
+            o.put("x", m.x.toDouble())
+            o.put("y", m.y.toDouble())
+            o.put("el", m.elevationMeters.toDouble())
+            mepArr.put(o)
+        }
+        root.put("mep", mepArr)
+
+        return root.toString()
+    }
+
+    private fun deserializeFullSnapshot(jsonStr: String): PlanSnapshot? {
+        return try {
+            val root = JSONObject(jsonStr)
+
+            // Walls
+            val walls = mutableListOf<WallSegment>()
+            val wallsArr = root.optJSONArray("walls")
+            if (wallsArr != null) {
+                for (i in 0 until wallsArr.length()) {
+                    val o = wallsArr.getJSONObject(i)
+                    var bo: WallBumpOut? = null
+                    if (o.has("bump")) {
+                        val bObj = o.getJSONObject("bump")
+                        bo = WallBumpOut(
+                            id = bObj.optString("id", "bo_$i"),
+                            offsetMeters = bObj.getDouble("off").toFloat(),
+                            widthMeters = bObj.getDouble("w").toFloat(),
+                            depthMeters = bObj.getDouble("d").toFloat(),
+                            isOutward = bObj.optBoolean("out", false)
+                        )
+                    }
+                    walls.add(
+                        WallSegment(
+                            id = o.optString("id", "w_$i"),
+                            start = Point2D(o.getDouble("sx").toFloat(), o.getDouble("sy").toFloat()),
+                            end = Point2D(o.getDouble("ex").toFloat(), o.getDouble("ey").toFloat()),
+                            thickness = o.optDouble("t", 0.15).toFloat(),
+                            height = o.optDouble("h", 2.80).toFloat(),
+                            innerColor = o.optLong("ic", 0xFFEAE6DC),
+                            outerColor = o.optLong("oc", 0xFFB0BEC5),
+                            isAccent = o.optBoolean("acc", false),
+                            accentColor = o.optLong("acCol", 0xFF1D3557),
+                            paintBrandCode = o.optString("brand", "Jotun 1024 Timeless"),
+                            bumpOut = bo
+                        )
+                    )
+                }
+            }
+
+            // Portals
+            val portals = mutableListOf<PortalItem>()
+            val portalsArr = root.optJSONArray("portals")
+            if (portalsArr != null) {
+                for (i in 0 until portalsArr.length()) {
+                    val o = portalsArr.getJSONObject(i)
+                    portals.add(
+                        PortalItem(
+                            id = o.optString("id", "p_$i"),
+                            wallId = o.optString("wallId", ""),
+                            offsetMeters = o.getDouble("off").toFloat(),
+                            width = o.getDouble("w").toFloat(),
+                            height = o.getDouble("h").toFloat(),
+                            elevation = o.optDouble("el", 0.0).toFloat(),
+                            type = try { PortalType.valueOf(o.getString("type")) } catch (_: Exception) { PortalType.SINGLE_DOOR },
+                            swing = try { DoorSwing.valueOf(o.getString("swing")) } catch (_: Exception) { DoorSwing.RIGHT_IN },
+                            frameColor = o.optLong("fc", 0xFF4A3728),
+                            glassType = try { GlassType.valueOf(o.getString("gt")) } catch (_: Exception) { GlassType.CLEAR }
+                        )
+                    )
+                }
+            }
+
+            // Rooms
+            val rooms = mutableListOf<RoomZone>()
+            val roomsArr = root.optJSONArray("rooms")
+            if (roomsArr != null) {
+                for (i in 0 until roomsArr.length()) {
+                    val o = roomsArr.getJSONObject(i)
+                    val pts = mutableListOf<Point2D>()
+                    val ptsArr = o.getJSONArray("pts")
+                    for (k in 0 until ptsArr.length()) {
+                        val po = ptsArr.getJSONObject(k)
+                        pts.add(Point2D(po.getDouble("x").toFloat(), po.getDouble("y").toFloat()))
+                    }
+                    rooms.add(
+                        RoomZone(
+                            id = o.optString("id", "r_$i"),
+                            name = o.optString("name", "غرفة"),
+                            points = pts,
+                            floorMaterial = try { FloorMaterial.valueOf(o.getString("mat")) } catch (_: Exception) { FloorMaterial.PORCELAIN_TILES },
+                            floorColor = o.optLong("col", 0xFFEDE8DF),
+                            tileSizeCm = o.optInt("tile", 60),
+                            ceilingHeight = o.optDouble("ch", 2.80).toFloat(),
+                            hasGypsumCove = o.optBoolean("cove", true)
+                        )
+                    )
+                }
+            }
+
+            // Furniture
+            val furniture = mutableListOf<FurnitureItem>()
+            val furnArr = root.optJSONArray("furniture")
+            if (furnArr != null) {
+                for (i in 0 until furnArr.length()) {
+                    val o = furnArr.getJSONObject(i)
+                    furniture.add(
+                        FurnitureItem(
+                            id = o.optString("id", "f_$i"),
+                            name = o.optString("name", "قطعة عفش"),
+                            category = try { FurnitureCategory.valueOf(o.getString("cat")) } catch (_: Exception) { FurnitureCategory.LIVING },
+                            x = o.getDouble("x").toFloat(),
+                            y = o.getDouble("y").toFloat(),
+                            width = o.getDouble("w").toFloat(),
+                            depth = o.getDouble("d").toFloat(),
+                            height = o.getDouble("h").toFloat(),
+                            rotationDeg = o.optDouble("rot", 0.0).toFloat(),
+                            primaryColor = o.optLong("pc", 0xFF37474F),
+                            secondaryColor = o.optLong("sc", 0xFF8D6E63),
+                            fabricColor = o.optLong("fc", 0xFFD7CCC8),
+                            materialName = o.optString("mat", "خشب زان"),
+                            isLocked = o.optBoolean("lock", false),
+                            priceEgp = o.optDouble("price", 10000.0),
+                            purchaseStatus = try { PurchaseStatus.valueOf(o.getString("stat")) } catch (_: Exception) { PurchaseStatus.IDEA },
+                            modelKey = o.optString("model", "box")
+                        )
+                    )
+                }
+            }
+
+            // Columns
+            val columns = mutableListOf<StructuralColumn>()
+            val colsArr = root.optJSONArray("columns")
+            if (colsArr != null) {
+                for (i in 0 until colsArr.length()) {
+                    val o = colsArr.getJSONObject(i)
+                    columns.add(
+                        StructuralColumn(
+                            id = o.optString("id", "c_$i"),
+                            x = o.getDouble("x").toFloat(),
+                            y = o.getDouble("y").toFloat(),
+                            width = o.getDouble("w").toFloat(),
+                            depth = o.getDouble("d").toFloat()
+                        )
+                    )
+                }
+            }
+
+            // MEP
+            val mep = mutableListOf<MepItem>()
+            val mepArr = root.optJSONArray("mep")
+            if (mepArr != null) {
+                for (i in 0 until mepArr.length()) {
+                    val o = mepArr.getJSONObject(i)
+                    mep.add(
+                        MepItem(
+                            id = o.optString("id", "m_$i"),
+                            nameAr = o.optString("name", "نقطة"),
+                            type = try { MepType.valueOf(o.getString("type")) } catch (_: Exception) { MepType.SOCKET_OUTLET },
+                            x = o.getDouble("x").toFloat(),
+                            y = o.getDouble("y").toFloat(),
+                            elevationMeters = o.optDouble("el", 0.40).toFloat()
+                        )
+                    )
+                }
+            }
+
+            PlanSnapshot(
+                walls = walls,
+                portals = portals,
+                rooms = rooms,
+                furniture = furniture,
+                columns = columns,
+                mepItems = mep
+            )
+        } catch (_: Exception) {
+            null
+        }
     }
 }
